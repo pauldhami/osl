@@ -8,8 +8,10 @@ import matplotlib.pyplot as plt
 import mne
 import numpy as np
 from sails.stft import glm_periodogram
-from scipy import signal, stats
+from scipy import signal, stats, sparse
 from .glm_base import GLMBaseResult, GroupGLMBaseResult, SensorClusterPerm, SensorMaxStatPerm
+
+from osl.source_recon.parcellation import spatial_dist_adjacency
 
 from matplotlib.patches import ConnectionPatch
 
@@ -262,7 +264,7 @@ class MaxStatPermuteGLMSpectrum(SensorMaxStatPerm):
     """A class holding the result for sensor x frequency cluster stats computed
     from a group level GLM-Spectrum"""
 
-    def plot_sig_clusters(self, thresh, ax=None, base=1):
+    def plot_sig_clusters(self, thresh, ax=None, base=1, **kwargs):
         """Plot the significant clusters at a given threshold.
 
         Parameters
@@ -282,7 +284,28 @@ class MaxStatPermuteGLMSpectrum(SensorMaxStatPerm):
         title = title.format(self.gl_contrast_name, self.fl_contrast_name)
 
         clu, obs = self.get_sig_clusters(thresh)
-        plot_joint_spectrum_clusters(self.f, obs, clu, self.info, base=base, ax=ax, title=title, ylabel='t-stat')
+        plot_joint_spectrum_clusters(self.f, obs, clu, self.info, base=base, ax=ax, title=title, ylabel='t-stat', **kwargs)
+
+
+class SourceMaxStatPermuteGLMSpectrum(MaxStatPermuteGLMSpectrum):
+    """A class holding the result for parcel x frequency cluster stats computed
+    from a group level GLM-Spectrum"""
+
+    def __init__(self, glmsp, gl_con, fl_con, parcellation_file, adjacency_distance=40, **kwargs):
+        self.parcellation_file = parcellation_file
+        self.adjacency_distance = adjacency_distance  # mm
+        glmsp.get_channel_adjacency = self.get_channel_adjacency
+        self.data = glmsp.data
+        super().__init__(glmsp, gl_con, fl_con, **kwargs)
+
+    def get_channel_adjacency(self):
+        """Return adjacency matrix of parcels in source-space."""
+        adjacency = spatial_dist_adjacency(self.parcellation_file, dist=self.adjacency_distance)
+        adjacency = sparse.coo_matrix(adjacency)
+        ntests = np.prod(self.data.data.shape[2:])
+        ntimes = self.data.data.shape[3]
+        print('{} : {}'.format(ntimes, ntests))
+        return mne.stats.cluster_level._setup_adjacency(adjacency, ntests, ntimes)
 
 
 class ClusterPermuteGLMSpectrum(SensorClusterPerm):
@@ -513,7 +536,7 @@ def read_glm_spectrum(infile):
 
 def plot_joint_spectrum_clusters(xvect, psd, clusters, info, ax=None, freqs='auto', base=1,
                                  topo_scale='joint', lw=0.5, ylabel='Power', title='', ylim=None,
-                                 xtick_skip=1, topo_prop=1/5):
+                                 xtick_skip=1, topo_prop=1/5, source=False):
     """
 
     Parameters
@@ -546,6 +569,8 @@ def plot_joint_spectrum_clusters(xvect, psd, clusters, info, ax=None, freqs='aut
          (Default value = 1)
     topo_prop :
          (Default value = 1/3)
+    source :
+        (Default value = False)
 
     Returns
     -------
@@ -562,7 +587,12 @@ def plot_joint_spectrum_clusters(xvect, psd, clusters, info, ax=None, freqs='aut
     main_prop = 1-title_prop-topo_prop
     main_ax = ax.inset_axes((0, 0, 1, main_prop))
 
-    plot_sensor_spectrum(xvect, psd, info, ax=main_ax, base=base, lw=0.25, ylabel=ylabel)
+    if source:
+        sensor_cols = False
+    else:
+        sensor_cols = True
+
+    plot_sensor_spectrum(xvect, psd, info, ax=main_ax, base=base, lw=0.25, ylabel=ylabel, sensor_cols=sensor_cols)
     fx = prep_scaled_freq(base, xvect)
 
     yl = main_ax.get_ylim()
@@ -635,9 +665,37 @@ def plot_joint_spectrum_clusters(xvect, psd, clusters, info, ax=None, freqs='aut
         main_ax.figure.add_artist(con)
 
         # Plot topo
-        dat = psd[fmid, :]
-        im, cn = mne.viz.plot_topomap(dat, info, axes=topo_ax, show=False, mask=channels, ch_type='planar1')
-        topos.append(im)
+        if source:
+            from osl_dynamics import files
+            from osl_dynamics.analysis import power
+            import nibabel as nib
+            from nilearn.plotting import plot_glass_brain
+
+            mask_file = "MNI152_T1_8mm_brain.nii.gz"
+            mask_file = files.check_exists(mask_file, files.mask.directory)
+            mask = nib.load(mask_file)
+
+            parcellation_file = "Glasser52_binary_space-MNI152NLin6_res-8x8x8.nii.gz"
+            parcellation_file = files.check_exists(parcellation_file, files.parcellation.directory)
+
+            dat = psd[fmid, :]
+            dat = power.parcel_vector_to_voxel_grid(mask_file, parcellation_file, dat)
+            nii = nib.Nifti1Image(dat, mask.affine, mask.header)
+
+            plot_glass_brain(
+                nii,
+                output_file=None,
+                display_mode="z",
+                colorbar=False,
+                axes=topo_ax,
+                cmap=plt.cm.seismic,
+                alpha=0.9,
+                plot_abs=False,
+            )
+        else:
+            dat = psd[fmid, :]
+            im, cn = mne.viz.plot_topomap(dat, info, axes=topo_ax, show=False, mask=channels, ch_type='planar1')
+            topos.append(im)
 
     if topo_scale == 'joint' and len(topos) > 0:
         vmin = np.min([t.get_clim()[0] for t in topos])
